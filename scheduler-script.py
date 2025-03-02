@@ -36,6 +36,7 @@ class DatabaseManager:
         CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
+            working_dir TEXT NOT NULL,
             script TEXT NOT NULL,
             python_exec TEXT NOT NULL,
             venv TEXT,
@@ -44,6 +45,7 @@ class DatabaseManager:
             next_run TEXT NOT NULL,
             interval_seconds INTEGER NOT NULL,
             log_retention INTEGER,
+            log_path TEXT,
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -60,6 +62,20 @@ class DatabaseManager:
             FOREIGN KEY (job_id) REFERENCES jobs(id)
         )
         ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        ''')
+        # Insertion des valeurs par défaut pour la configuration si elles n'existent pas
+        cursor.execute("SELECT value FROM config WHERE key = 'log_retention'")
+        if not cursor.fetchone():
+            cursor.execute("INSERT INTO config (key, value) VALUES ('log_retention', '7')")
+        
+        cursor.execute("SELECT value FROM config WHERE key = 'log_dir'")
+        if not cursor.fetchone():
+            cursor.execute("INSERT INTO config (key, value) VALUES ('log_dir', 'logs')")
         conn.commit()
         conn.close()
     
@@ -67,8 +83,11 @@ class DatabaseManager:
         conn = self.get_connection()
         cursor = conn.cursor()
         now = datetime.datetime.now().isoformat()
-        # Si log_retention n'est pas présent, on stocke NULL (ce qui indiquera l'utilisation de la valeur globale)
+        # Champs additionnels
         lr = job_data.get("log_retention")
+        log_path = job_data.get("log_path")
+        working_dir = job_data.get("working_dir")
+
         cursor.execute("SELECT id FROM jobs WHERE id = ?", (job_data['id'],))
         exists = cursor.fetchone()
         if exists:
@@ -78,11 +97,13 @@ class DatabaseManager:
                 script = ?,
                 python_exec = ?,
                 venv = ?,
+                working_dir = ?,
                 start_time = ?,
                 repeat_time = ?,
                 next_run = ?,
                 interval_seconds = ?,
                 log_retention = ?,
+                log_path = ?,
                 active = ?,
                 updated_at = ?
             WHERE id = ?
@@ -91,11 +112,13 @@ class DatabaseManager:
                 job_data['script'],
                 job_data['python_exec'],
                 job_data['venv'],
+                working_dir,
                 job_data['start_time'],
                 job_data['repeat_time'],
                 job_data['next_run'].isoformat(),
                 job_data['interval_seconds'],
                 lr,
+                log_path,
                 job_data['active'],
                 now,
                 job_data['id']
@@ -103,20 +126,22 @@ class DatabaseManager:
         else:
             cursor.execute('''
             INSERT INTO jobs (
-                id, name, script, python_exec, venv, start_time, repeat_time,
-                next_run, interval_seconds, log_retention, active, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                id, name, script, python_exec, venv, working_dir, start_time, repeat_time,
+                next_run, interval_seconds, log_retention, log_path, active, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 job_data['id'],
                 job_data['name'],
                 job_data['script'],
                 job_data['python_exec'],
                 job_data['venv'],
+                working_dir,
                 job_data['start_time'],
                 job_data['repeat_time'],
                 job_data['next_run'].isoformat(),
                 job_data['interval_seconds'],
                 lr,
+                log_path,
                 job_data['active'],
                 now,
                 now
@@ -181,6 +206,25 @@ class DatabaseManager:
         conn.commit()
         conn.close()
 
+    def get_config(self, key: str, default: str = None) -> str:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM config WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        conn.close()
+        return row['value'] if row else default
+    
+    def set_config(self, key: str, value: str) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM config WHERE key = ?", (key,))
+        if cursor.fetchone():
+            cursor.execute("UPDATE config SET value = ? WHERE key = ?", (value, key))
+        else:
+            cursor.execute("INSERT INTO config (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+        conn.close()
+
 
 class ConfigManager:
     """Gère le chargement et la validation de la configuration."""
@@ -195,7 +239,12 @@ class ConfigManager:
             for field in required_fields:
                 if field not in config:
                     raise ValueError(f"Champ requis manquant dans la configuration: {field}")
-            ConfigManager.validate_script_path(config['script'])
+            # Si un répertoire de travail est spécifié, on valide le chemin complet
+            if 'working_dir' in config:
+                script_path = os.path.join(config['working_dir'], config['script'])
+                ConfigManager.validate_script_path(script_path)
+            else:
+                ConfigManager.validate_script_path(config['script'])
             return config
         except FileNotFoundError:
             logging.error(f"Fichier de configuration non trouvé: {config_file}")
@@ -221,10 +270,11 @@ class ConfigManager:
 class LogManager:
     """Gère la configuration et la rotation des logs."""
     
-    def __init__(self, log_dir: str, global_retention: int):
-        self.log_dir = log_dir
-        self.global_retention = global_retention
-        os.makedirs(log_dir, exist_ok=True)
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+        self.log_dir = self.db_manager.get_config('log_dir', 'logs')
+        self.global_retention = int(self.db_manager.get_config('log_retention', '7'))
+        os.makedirs(self.log_dir, exist_ok=True)
         self.setup_main_logger()
         self.last_cleanup_check = datetime.datetime.now()
     
@@ -246,7 +296,13 @@ class LogManager:
         console_handler.setFormatter(log_format)
         root_logger.addHandler(console_handler)
     
-    def get_job_log_directory(self, job_name: str, repeat_time: str, retention: Optional[int] = None) -> str:
+    def get_job_log_directory(self, job_id: str, job_name: str, repeat_time: str, retention: Optional[int] = None) -> str:
+        job = self.db_manager.get_job(job_id)
+        if job and job.get('log_path'):
+            job_dir = job['log_path']
+            # S'assurer que le répertoire existe
+            os.makedirs(job_dir, exist_ok=True)
+            return job_dir
         # Nettoie le nom de la tâche : remplace les espaces par des underscores et tronque à 30 caractères
         sanitized = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in job_name).lower()
         if len(sanitized) > 30:
@@ -260,16 +316,11 @@ class LogManager:
                 suffix += 1
             job_dir = f"{job_dir}{suffix}"
         os.makedirs(job_dir, exist_ok=True)
-        # Si une rétention spécifique est fournie, on la sauvegarde dans le répertoire
-        if retention is not None:
-            retention_file = os.path.join(job_dir, "retention.txt")
-            with open(retention_file, "w") as f:
-                f.write(str(retention))
         return job_dir
     
-    def get_job_log_file(self, job_name: str, repeat_time: str, retention: Optional[int] = None) -> str:
+    def get_job_log_file(self, job_id: str ,job_name: str, repeat_time: str, retention: Optional[int] = None) -> str:
         # Utilise le répertoire dédié au job pour créer le fichier de log
-        job_dir = self.get_job_log_directory(job_name, repeat_time, retention)
+        job_dir = self.get_job_log_directory(job_id, job_name, repeat_time, retention)
         sanitized = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in job_name).lower()
         if len(sanitized) > 30:
             sanitized = sanitized[:30]
@@ -322,17 +373,26 @@ class ScriptExecutor:
             os.system('clear')
     
     @staticmethod
-    def secure_command(script: str, python_exec: str) -> List[str]:
-        script_path = pathlib.Path(script).resolve()
-        python_path = shlex.quote(python_exec)
+    def secure_command(script: str, python_exec: str, working_dir: Optional[str] = None) -> List[str]:
+        if working_dir:
+            script_path = pathlib.Path(os.path.join(working_dir, script)).resolve()
+        else:
+            script_path = pathlib.Path(script).resolve()
+            
+        # Utiliser directement l'exécutable Python sans appliquer shlex.quote
+        python_path = python_exec
         if not script_path.exists() or script_path.suffix != '.py':
             raise ValueError(f"Script invalide: {script}")
         return [python_path, str(script_path)]
     
-    def execute(self, job_id: str, job_name: str, script: str, repeat_time: str, retention: Optional[int], python_exec: str = "python", venv: Optional[str] = None) -> bool:
+    def execute(self, job_id: str, job_name: str, script: str, repeat_time: str, 
+                python_exec: str = "python", venv: Optional[str] = None, 
+                working_dir: Optional[str] = None) -> bool:
         self.clear_console()
         current_time = datetime.datetime.now()
-        log_file = self.log_manager.get_job_log_file(job_name, repeat_time, retention)
+        job = self.db_manager.get_job(job_id)
+        retention = job.get('log_retention') if job else None
+        log_file = self.log_manager.get_job_log_file(job_id, job_name, repeat_time, retention)
         logging.info(f"Lancement du script Python {script} (Job ID: {job_id} - {job_name})...")
         run_id = self.db_manager.record_job_run(job_id, log_file)
         try:
@@ -343,15 +403,23 @@ class ScriptExecutor:
                     python_path = os.path.join(venv, 'bin', 'python')
             else:
                 python_path = python_exec
-            cmd = self.secure_command(script, python_path)
+            cmd = self.secure_command(script, python_path, working_dir)
+            
+            # Définir le répertoire de travail pour subprocess.run
+            subprocess_cwd = working_dir if working_dir else None
+            
             with open(log_file, 'a') as f:
                 f.write(f"[{current_time}] Lancement du script Python {script} (Job ID: {job_id} - {job_name})...\n")
+                if working_dir:
+                    f.write(f"Répertoire de travail: {working_dir}\n")
+                
                 result = subprocess.run(
                     cmd,
                     check=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True
+                    text=True,
+                    cwd=subprocess_cwd
                 )
                 f.write(result.stdout)
                 f.write(result.stderr)
@@ -399,7 +467,8 @@ class Scheduler:
             raise ValueError("Unité invalide. Utilisez 'h' pour heures, 'm' pour minutes, ou 's' pour secondes.")
     
     def schedule_job(self, job_id: str, job_name: str, start_time_str: str, repeat_time: str, 
-                     script: str, python_exec: str = "python", venv: Optional[str] = None, log_retention: Optional[int] = None) -> Tuple[datetime.datetime, datetime.timedelta]:
+                     script: str, python_exec: str = "python", venv: Optional[str] = None, 
+                     log_retention: Optional[int] = None, working_dir: Optional[str] = None) -> Tuple[datetime.datetime, datetime.timedelta]:
         if start_time_str == "24:00:00":
             start_time_str = "00:00:00"
         interval = self.parse_interval(repeat_time)
@@ -414,6 +483,11 @@ class Scheduler:
                 first_run += interval
             return first_run
         next_run_time = calculate_next_run()
+        existing_job = self.db_manager.get_job(job_id)
+        log_path = existing_job.get('log_path') if existing_job else None
+
+        if not log_path:
+            log_path = self.log_manager.get_job_log_directory(job_id, job_name, repeat_time, log_retention)
         job_info = {
             'id': job_id,
             'name': job_name,
@@ -426,11 +500,13 @@ class Scheduler:
             'interval_seconds': int(interval.total_seconds()),
             'next_run': next_run_time,
             'log_retention': log_retention,
+            'log_path': log_path,
+            'working_dir': working_dir,
             'active': 1
         }
         def job_wrapper():
-            # Exécute la tâche et affiche la prochaine exécution
-            self.executor.execute(job_info['id'], job_info['name'], job_info['script'], job_info['repeat_time'], job_info['python_exec'], job_info['venv'], )  # Note: On passe log_retention dans l'exécution via job_info
+            # Exécute la tâche et planifie la prochaine exécution
+            self.executor.execute(job_info['id'], job_info['name'], job_info['script'], job_info['repeat_time'], job_info['python_exec'], job_info['venv'], job_info['working_dir'])
             job_info['next_run'] += job_info['interval']
             self.db_manager.save_job(job_info)
             schedule.clear(tag=job_info['id'])
@@ -459,6 +535,7 @@ def parse_arguments():
     add_parser.add_argument('--venv', help="Chemin vers l'environnement virtuel (optionnel)")
     add_parser.add_argument('--start_time', help='Heure de début au format HH:MM:SS')
     add_parser.add_argument('--repeat_time', help='Intervalle de répétition (ex: 1h, 30m, 45s)')
+    add_parser.add_argument('--working_dir', help="Répertoire de travail pour l'exécution du script (pour les chemins relatifs)")
     
     # Commande 'mod' pour modifier un job existant
     mod_parser = subparsers.add_parser('mod', help='Modifier un job existant')
@@ -469,6 +546,7 @@ def parse_arguments():
     mod_parser.add_argument('--venv', help="Nouveau chemin vers l'environnement virtuel")
     mod_parser.add_argument('--start_time', help='Nouvelle heure de début au format HH:MM:SS')
     mod_parser.add_argument('--repeat_time', help='Nouvel intervalle de répétition (ex: 1h, 30m, 45s)')
+    mod_parser.add_argument('--working_dir', help="Nouveau répertoire de travail pour l'exécution du script")
     
     # Commande 'list'
     subparsers.add_parser('list', help='Lister tous les jobs planifiés (chargés depuis la base de données)')
@@ -490,12 +568,14 @@ def parse_arguments():
 def main():
     args = parse_arguments()
     
+    db_manager = DatabaseManager()
+
     # Valeur globale de rétention
     global_retention = args.log_retention
+
+    db_manager.set_config('log_retention', str(args.log_retention))
     
-    log_dir = "logs"
-    log_manager = LogManager(log_dir, global_retention)
-    db_manager = DatabaseManager()
+    log_manager = LogManager(db_manager)
     executor = ScriptExecutor(log_manager, db_manager)
     scheduler_obj = Scheduler(executor, log_manager, db_manager)
     
@@ -507,6 +587,7 @@ def main():
                 print(f"Erreur lors du chargement du fichier de configuration: {e}")
                 sys.exit(1)
             job_id = str(uuid.uuid4())
+            working_dir = config.get("working_dir")
             job_name = config.get("name")
             script = config.get("script")
             python_exec = config.get("python_exec", "python")
@@ -524,6 +605,7 @@ def main():
                 print(f"Argument(s) requis manquant(s): {', '.join(missing)}")
                 sys.exit(1)
             job_id = args.id if args.id else str(uuid.uuid4())
+            working_dir = args.working_dir
             job_name = args.name
             script = args.script
             python_exec = args.python_exec
@@ -533,7 +615,7 @@ def main():
             profile_retention = None  # N'utilise que la valeur globale
             
         try:
-            next_run, interval = scheduler_obj.schedule_job(job_id, job_name, start_time, repeat_time, script, python_exec, venv, profile_retention)
+            next_run, interval = scheduler_obj.schedule_job(job_id, job_name, start_time, repeat_time, script, python_exec, venv, profile_retention, working_dir)
             print(f"Job ajouté: {job_id} - {job_name}, prochaine exécution à: {next_run}")
         except Exception as e:
             print(f"Erreur lors de la planification du job: {e}")
@@ -550,10 +632,10 @@ def main():
         new_venv = args.venv if args.venv is not None else job['venv']
         new_start_time = args.start_time if args.start_time is not None else job['start_time']
         new_repeat_time = args.repeat_time if args.repeat_time is not None else job['repeat_time']
-        # On ne modifie pas la rétention si elle n'est pas passée en argument lors de la modif
+        new_working_dir = args.working_dir if args.working_dir is not None else job.get("working_dir")
         new_retention = job.get("log_retention")
         try:
-            next_run, interval = scheduler_obj.schedule_job(args.id, new_name, new_start_time, new_repeat_time, new_script, new_python_exec, new_venv, new_retention)
+            next_run, interval = scheduler_obj.schedule_job(args.id, new_name, new_start_time, new_repeat_time, new_script, new_python_exec, new_venv, new_retention, new_working_dir)
             print(f"Job modifié: {args.id} - {new_name}, prochaine exécution à: {next_run}")
         except Exception as e:
             print(f"Erreur lors de la modification du job: {e}")
@@ -590,12 +672,7 @@ def main():
         print("Planificateur démarré. Appuyez sur Ctrl+C pour arrêter.")
         try:
             for job in jobs:
-                now = datetime.datetime.now()
-                interval = datetime.timedelta(seconds=job['interval_seconds'])
-                next_run = job['next_run']
-                while next_run < now:
-                    next_run += interval
-                scheduler_obj.schedule_job(job['id'], job['name'], job['start_time'], job['repeat_time'], job['script'], job['python_exec'], job['venv'], job.get("log_retention"))
+                scheduler_obj.schedule_job(job['id'], job['name'], job['start_time'], job['repeat_time'], job['script'], job['python_exec'], job['venv'], job.get("log_retention"), job.get("working_dir"))
             while True:
                 schedule.run_pending()
                 time.sleep(1)
