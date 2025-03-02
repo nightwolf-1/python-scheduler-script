@@ -593,7 +593,6 @@ def parse_arguments():
     
     return parser.parse_args()
 
-
 def main():
     args = parse_arguments()
     
@@ -624,7 +623,7 @@ def main():
             profile_retention = int(config.get("log_retention", args.log_retention))
         else:
             missing = []
-            for field in ['name', 'script', 'start_time', 'repeat_time']:
+            for field in ['name', 'script', 'start_time', 'repeat_time', 'working_dir']:
                 if getattr(args, field) is None:
                     missing.append(field)
             if missing:
