@@ -14,7 +14,30 @@ from typing import Tuple, Dict, Any, Optional, List
 import argparse
 import shlex
 import pathlib
-import uuid  # pour générer automatiquement un identifiant unique
+import uuid
+import jsonschema  # pour valider le JSON
+
+# Définition du schéma JSON pour la configuration
+CONFIG_SCHEMA = {
+    "type": "object",
+    "properties": {
+         "name": {"type": "string"},
+         "script": {"type": "string"},
+         "python_exec": {"type": "string"},
+         "venv": {"type": "string"},
+         "start_time": {
+             "type": "string",
+             "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$"
+         },
+         "repeat_time": {
+             "type": "string",
+             "pattern": "^[0-9]+[hms]$"
+         },
+         "log_retention": {"type": "integer"},
+         "working_dir": {"type": "string"}
+    },
+    "required": ["name", "script", "start_time", "repeat_time", "log_retention", "working_dir"]
+}
 
 
 class DatabaseManager:
@@ -73,9 +96,9 @@ class DatabaseManager:
         if not cursor.fetchone():
             cursor.execute("INSERT INTO config (key, value) VALUES ('log_retention', '7')")
         
-        cursor.execute("SELECT value FROM config WHERE key = 'log_dir'")
+        cursor.execute("SELECT value FROM config WHERE key = 'log_path'")
         if not cursor.fetchone():
-            cursor.execute("INSERT INTO config (key, value) VALUES ('log_dir', 'logs')")
+            cursor.execute("INSERT INTO config (key, value) VALUES ('log_path', 'logs')")
         conn.commit()
         conn.close()
     
@@ -83,7 +106,6 @@ class DatabaseManager:
         conn = self.get_connection()
         cursor = conn.cursor()
         now = datetime.datetime.now().isoformat()
-        # Champs additionnels
         lr = job_data.get("log_retention")
         log_path = job_data.get("log_path")
         working_dir = job_data.get("working_dir")
@@ -225,26 +247,28 @@ class DatabaseManager:
         conn.commit()
         conn.close()
 
+    def get_all_config(self) -> Dict[str, str]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM config")
+        configs = {row['key']: row['value'] for row in cursor.fetchall()}
+        conn.close()
+        return configs
+
 
 class ConfigManager:
-    """Gère le chargement et la validation de la configuration."""
+    """Gère le chargement, la validation de la configuration et sa validation via JSON Schema."""
     
     @staticmethod
     def load_config(config_file: str) -> Dict[str, Any]:
         try:
             with open(config_file, 'r') as f:
                 config = json.load(f)
-            # Les champs requis incluent désormais log_retention
-            required_fields = ['start_time', 'script', 'repeat_time', 'log_retention', 'name']
-            for field in required_fields:
-                if field not in config:
-                    raise ValueError(f"Champ requis manquant dans la configuration: {field}")
-            # Si un répertoire de travail est spécifié, on valide le chemin complet
-            if 'working_dir' in config:
-                script_path = os.path.join(config['working_dir'], config['script'])
-                ConfigManager.validate_script_path(script_path)
-            else:
-                ConfigManager.validate_script_path(config['script'])
+            # Valide la configuration avec le schéma JSON
+            jsonschema.validate(instance=config, schema=CONFIG_SCHEMA)
+            # Comme working_dir est désormais requis, on le valide directement
+            script_path = os.path.join(config['working_dir'], config['script'])
+            ConfigManager.validate_script_path(script_path)
             return config
         except FileNotFoundError:
             logging.error(f"Fichier de configuration non trouvé: {config_file}")
@@ -252,6 +276,9 @@ class ConfigManager:
         except json.JSONDecodeError:
             logging.error(f"Format JSON invalide dans le fichier: {config_file}")
             raise
+        except jsonschema.ValidationError as ve:
+            logging.error(f"Échec de validation de la configuration: {ve.message}")
+            raise ValueError(f"Configuration invalide: {ve.message}")
     
     @staticmethod
     def validate_script_path(script_path: str) -> bool:
@@ -272,13 +299,15 @@ class LogManager:
     
     def __init__(self, db_manager: DatabaseManager):
         self.db_manager = db_manager
-        self.log_dir = self.db_manager.get_config('log_dir', 'logs')
+        # Utilise la clé 'log_path' dans la table config
+        self.log_dir = self.db_manager.get_config('log_path', 'logs')
         self.global_retention = int(self.db_manager.get_config('log_retention', '7'))
         os.makedirs(self.log_dir, exist_ok=True)
         self.setup_main_logger()
         self.last_cleanup_check = datetime.datetime.now()
     
     def setup_main_logger(self) -> None:
+        # Un fichier par jour pour le scheduler global
         log_file = os.path.join(self.log_dir, f"scheduler_{datetime.datetime.now().strftime('%Y-%m-%d')}.log")
         file_handler = RotatingFileHandler(
             filename=log_file,
@@ -300,16 +329,14 @@ class LogManager:
         job = self.db_manager.get_job(job_id)
         if job and job.get('log_path'):
             job_dir = job['log_path']
-            # S'assurer que le répertoire existe
             os.makedirs(job_dir, exist_ok=True)
             return job_dir
-        # Nettoie le nom de la tâche : remplace les espaces par des underscores et tronque à 30 caractères
         sanitized = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in job_name).lower()
         if len(sanitized) > 30:
             sanitized = sanitized[:30]
-        base_dir_name = f"{sanitized}_{repeat_time}"
+        # Suppression de repeat_time dans le nom du répertoire
+        base_dir_name = sanitized
         job_dir = os.path.join(self.log_dir, base_dir_name)
-        # Si le répertoire existe déjà, ajoute un suffixe numérique
         if os.path.exists(job_dir):
             suffix = 1
             while os.path.exists(f"{job_dir}{suffix}"):
@@ -318,14 +345,15 @@ class LogManager:
         os.makedirs(job_dir, exist_ok=True)
         return job_dir
     
-    def get_job_log_file(self, job_id: str ,job_name: str, repeat_time: str, retention: Optional[int] = None) -> str:
-        # Utilise le répertoire dédié au job pour créer le fichier de log
+    def get_job_log_file(self, job_id: str, job_name: str, repeat_time: str, retention: Optional[int] = None) -> str:
+        # Un fichier de log par jour pour chaque job
         job_dir = self.get_job_log_directory(job_id, job_name, repeat_time, retention)
         sanitized = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in job_name).lower()
         if len(sanitized) > 30:
             sanitized = sanitized[:30]
-        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        filename = f"{sanitized}_{timestamp}.log"
+        # Format : nomjob_YYYY-MM-DD.log
+        date_str = datetime.datetime.now().strftime('%Y-%m-%d')
+        filename = f"{sanitized}_{date_str}.log"
         return os.path.join(job_dir, filename)
     
     def clear_old_logs(self, force: bool = False) -> None:
@@ -335,9 +363,7 @@ class LogManager:
         self.last_cleanup_check = now
         logging.info("Lancement du nettoyage des logs...")
         try:
-            # Parcours de toutes les sous-arborescences de self.log_dir
             for root, _, files in os.walk(self.log_dir):
-                # Vérifie si le répertoire contient un fichier retention.txt
                 retention_file = os.path.join(root, "retention.txt")
                 if os.path.isfile(retention_file):
                     with open(retention_file, "r") as f:
@@ -378,8 +404,6 @@ class ScriptExecutor:
             script_path = pathlib.Path(os.path.join(working_dir, script)).resolve()
         else:
             script_path = pathlib.Path(script).resolve()
-            
-        # Utiliser directement l'exécutable Python sans appliquer shlex.quote
         python_path = python_exec
         if not script_path.exists() or script_path.suffix != '.py':
             raise ValueError(f"Script invalide: {script}")
@@ -404,15 +428,11 @@ class ScriptExecutor:
             else:
                 python_path = python_exec
             cmd = self.secure_command(script, python_path, working_dir)
-            
-            # Définir le répertoire de travail pour subprocess.run
             subprocess_cwd = working_dir if working_dir else None
-            
             with open(log_file, 'a') as f:
                 f.write(f"[{current_time}] Lancement du script Python {script} (Job ID: {job_id} - {job_name})...\n")
                 if working_dir:
                     f.write(f"Répertoire de travail: {working_dir}\n")
-                
                 result = subprocess.run(
                     cmd,
                     check=True,
@@ -424,7 +444,6 @@ class ScriptExecutor:
                 f.write(result.stdout)
                 f.write(result.stderr)
                 logging.info(f"Exécution réussie de {script} (Job ID: {job_id} - {job_name})")
-                logging.debug(result.stdout)
                 if result.stderr:
                     logging.warning(f"Messages d'erreur de {script}: {result.stderr}")
                 self.db_manager.update_job_run(run_id, 'success')
@@ -505,7 +524,6 @@ class Scheduler:
             'active': 1
         }
         def job_wrapper():
-            # Exécute la tâche et planifie la prochaine exécution
             self.executor.execute(job_info['id'], job_info['name'], job_info['script'], job_info['repeat_time'], job_info['python_exec'], job_info['venv'], job_info['working_dir'])
             job_info['next_run'] += job_info['interval']
             self.db_manager.save_job(job_info)
@@ -520,7 +538,6 @@ class Scheduler:
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Planificateur de scripts Python")
-    # Option globale pour log_retention
     parser.add_argument("--log_retention", type=int, default=7, help="Nombre de jours de rétention des logs global (défaut: 7)")
     
     subparsers = parser.add_subparsers(dest='command', help='Commande à exécuter')
@@ -535,9 +552,10 @@ def parse_arguments():
     add_parser.add_argument('--venv', help="Chemin vers l'environnement virtuel (optionnel)")
     add_parser.add_argument('--start_time', help='Heure de début au format HH:MM:SS')
     add_parser.add_argument('--repeat_time', help='Intervalle de répétition (ex: 1h, 30m, 45s)')
-    add_parser.add_argument('--working_dir', help="Répertoire de travail pour l'exécution du script (pour les chemins relatifs)")
+    # working_dir est désormais requis pour ajouter un job
+    add_parser.add_argument('--working_dir', help="Répertoire de travail pour l'exécution du script (obligatoire)")
     
-    # Commande 'mod' pour modifier un job existant
+    # Commande 'mod'
     mod_parser = subparsers.add_parser('mod', help='Modifier un job existant')
     mod_parser.add_argument('--id', help='Identifiant unique du job à modifier', required=True)
     mod_parser.add_argument('--name', help='Nouveau nom descriptif du job')
@@ -546,6 +564,7 @@ def parse_arguments():
     mod_parser.add_argument('--venv', help="Nouveau chemin vers l'environnement virtuel")
     mod_parser.add_argument('--start_time', help='Nouvelle heure de début au format HH:MM:SS')
     mod_parser.add_argument('--repeat_time', help='Nouvel intervalle de répétition (ex: 1h, 30m, 45s)')
+    # working_dir peut être mis à jour via mod; si non fourni, on garde l'existant
     mod_parser.add_argument('--working_dir', help="Nouveau répertoire de travail pour l'exécution du script")
     
     # Commande 'list'
@@ -555,12 +574,22 @@ def parse_arguments():
     remove_parser = subparsers.add_parser('remove', help='Supprimer un job')
     remove_parser.add_argument('--id', help='Identifiant unique du job à supprimer', required=True)
     
-    # Commande 'show' pour afficher les paramètres d'un job
-    show_parser = subparsers.add_parser('show', help='Afficher les paramètres d\'un job')
+    # Commande 'show'
+    show_parser = subparsers.add_parser('show', help="Afficher les paramètres d'un job")
     show_parser.add_argument('--id', help='Identifiant unique du job à afficher', required=True)
     
     # Commande 'run'
     subparsers.add_parser('run', help='Démarrer le planificateur (chargera les jobs depuis la DB)')
+    
+    # Nouvelles commandes pour la configuration
+    config_parser = subparsers.add_parser('config', help='Gestion de la configuration')
+    config_subparsers = config_parser.add_subparsers(dest='config_command', help='Sous-commande de configuration')
+    
+    config_set_parser = config_subparsers.add_parser('set', help='Définir une clé de configuration')
+    config_set_parser.add_argument('key', type=str, help='Clé de configuration (ex: log_path, log_retention)')
+    config_set_parser.add_argument('value', type=str, help='Valeur à définir')
+    
+    config_subparsers.add_parser('list', help='Lister toutes les configurations')
     
     return parser.parse_args()
 
@@ -570,9 +599,7 @@ def main():
     
     db_manager = DatabaseManager()
 
-    # Valeur globale de rétention
-    global_retention = args.log_retention
-
+    # Mise à jour de la rétention globale dans la DB
     db_manager.set_config('log_retention', str(args.log_retention))
     
     log_manager = LogManager(db_manager)
@@ -594,8 +621,7 @@ def main():
             venv = config.get("venv")
             start_time = config.get("start_time")
             repeat_time = config.get("repeat_time")
-            # Utilise la rétention définie dans le profil
-            profile_retention = int(config.get("log_retention", global_retention))
+            profile_retention = int(config.get("log_retention", args.log_retention))
         else:
             missing = []
             for field in ['name', 'script', 'start_time', 'repeat_time']:
@@ -612,8 +638,7 @@ def main():
             venv = args.venv
             start_time = args.start_time
             repeat_time = args.repeat_time
-            profile_retention = None  # N'utilise que la valeur globale
-            
+            profile_retention = None
         try:
             next_run, interval = scheduler_obj.schedule_job(job_id, job_name, start_time, repeat_time, script, python_exec, venv, profile_retention, working_dir)
             print(f"Job ajouté: {job_id} - {job_name}, prochaine exécution à: {next_run}")
@@ -679,6 +704,21 @@ def main():
                 log_manager.clear_old_logs()
         except KeyboardInterrupt:
             print("Arrêt du planificateur.")
+    
+    elif args.command == 'config':
+        # Gestion des commandes de configuration
+        if args.config_command == 'set':
+            db_manager.set_config(args.key, args.value)
+            print(f"Configuration '{args.key}' définie à '{args.value}'.")
+        elif args.config_command == 'list':
+            configs = db_manager.get_all_config()
+            if configs:
+                for key, value in configs.items():
+                    print(f"{key}: {value}")
+            else:
+                print("Aucune configuration trouvée.")
+        else:
+            print("Sous-commande config non reconnue.")
     
     else:
         print("Commande non reconnue. Utilisez --help pour voir les commandes disponibles.")
