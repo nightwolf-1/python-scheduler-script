@@ -8,9 +8,178 @@ import signal
 import os
 import json
 import logging
+import sqlite3
 from logging.handlers import RotatingFileHandler
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 import argparse
+import shlex
+import pathlib
+import uuid  # pour générer automatiquement un identifiant unique
+
+
+class DatabaseManager:
+    """Gère les opérations de base de données pour le planificateur."""
+    
+    def __init__(self, db_path: str = "scheduler.db"):
+        self.db_path = db_path
+        self.initialize_db()
+    
+    def get_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def initialize_db(self) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            script TEXT NOT NULL,
+            python_exec TEXT NOT NULL,
+            venv TEXT,
+            start_time TEXT NOT NULL,
+            repeat_time TEXT NOT NULL,
+            next_run TEXT NOT NULL,
+            interval_seconds INTEGER NOT NULL,
+            log_retention INTEGER,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS job_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT,
+            status TEXT NOT NULL,
+            log_file TEXT,
+            FOREIGN KEY (job_id) REFERENCES jobs(id)
+        )
+        ''')
+        conn.commit()
+        conn.close()
+    
+    def save_job(self, job_data: Dict[str, Any]) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        now = datetime.datetime.now().isoformat()
+        # Si log_retention n'est pas présent, on stocke NULL (ce qui indiquera l'utilisation de la valeur globale)
+        lr = job_data.get("log_retention")
+        cursor.execute("SELECT id FROM jobs WHERE id = ?", (job_data['id'],))
+        exists = cursor.fetchone()
+        if exists:
+            cursor.execute('''
+            UPDATE jobs SET
+                name = ?,
+                script = ?,
+                python_exec = ?,
+                venv = ?,
+                start_time = ?,
+                repeat_time = ?,
+                next_run = ?,
+                interval_seconds = ?,
+                log_retention = ?,
+                active = ?,
+                updated_at = ?
+            WHERE id = ?
+            ''', (
+                job_data['name'],
+                job_data['script'],
+                job_data['python_exec'],
+                job_data['venv'],
+                job_data['start_time'],
+                job_data['repeat_time'],
+                job_data['next_run'].isoformat(),
+                job_data['interval_seconds'],
+                lr,
+                job_data['active'],
+                now,
+                job_data['id']
+            ))
+        else:
+            cursor.execute('''
+            INSERT INTO jobs (
+                id, name, script, python_exec, venv, start_time, repeat_time,
+                next_run, interval_seconds, log_retention, active, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                job_data['id'],
+                job_data['name'],
+                job_data['script'],
+                job_data['python_exec'],
+                job_data['venv'],
+                job_data['start_time'],
+                job_data['repeat_time'],
+                job_data['next_run'].isoformat(),
+                job_data['interval_seconds'],
+                lr,
+                job_data['active'],
+                now,
+                now
+            ))
+        conn.commit()
+        conn.close()
+    
+    def get_all_jobs(self) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM jobs WHERE active = 1")
+        jobs = []
+        for row in cursor.fetchall():
+            job = dict(row)
+            job['next_run'] = datetime.datetime.fromisoformat(job['next_run'])
+            jobs.append(job)
+        conn.close()
+        return jobs
+    
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM jobs WHERE id = ? AND active = 1", (job_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            job = dict(row)
+            job['next_run'] = datetime.datetime.fromisoformat(job['next_run'])
+            return job
+        return None
+    
+    def deactivate_job(self, job_id: str) -> bool:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE jobs SET active = 0, updated_at = ? WHERE id = ?", 
+                     (datetime.datetime.now().isoformat(), job_id))
+        updated = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return updated
+    
+    def record_job_run(self, job_id: str, log_file: str) -> int:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        now = datetime.datetime.now().isoformat()
+        cursor.execute('''
+        INSERT INTO job_runs (job_id, start_time, status, log_file)
+        VALUES (?, ?, ?, ?)
+        ''', (job_id, now, 'running', log_file))
+        run_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return run_id
+    
+    def update_job_run(self, run_id: int, status: str) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        now = datetime.datetime.now().isoformat()
+        cursor.execute('''
+        UPDATE job_runs SET status = ?, end_time = ? WHERE id = ?
+        ''', (status, now, run_id))
+        conn.commit()
+        conn.close()
 
 
 class ConfigManager:
@@ -18,28 +187,15 @@ class ConfigManager:
     
     @staticmethod
     def load_config(config_file: str) -> Dict[str, Any]:
-        """Charge la configuration depuis un fichier JSON.
-        
-        Args:
-            config_file: Chemin vers le fichier de configuration JSON
-            
-        Returns:
-            Dictionnaire contenant la configuration
-            
-        Raises:
-            FileNotFoundError: Si le fichier de configuration n'existe pas
-            json.JSONDecodeError: Si le fichier n'est pas un JSON valide
-        """
         try:
             with open(config_file, 'r') as f:
                 config = json.load(f)
-            
-            # Validation de base
-            required_fields = ['start_time', 'script', 'repeat_time', 'log_retention']
+            # Les champs requis incluent désormais log_retention
+            required_fields = ['start_time', 'script', 'repeat_time', 'log_retention', 'name']
             for field in required_fields:
                 if field not in config:
                     raise ValueError(f"Champ requis manquant dans la configuration: {field}")
-            
+            ConfigManager.validate_script_path(config['script'])
             return config
         except FileNotFoundError:
             logging.error(f"Fichier de configuration non trouvé: {config_file}")
@@ -47,86 +203,102 @@ class ConfigManager:
         except json.JSONDecodeError:
             logging.error(f"Format JSON invalide dans le fichier: {config_file}")
             raise
+    
+    @staticmethod
+    def validate_script_path(script_path: str) -> bool:
+        normalized_path = os.path.normpath(script_path)
+        dangerous_chars = ['|', '&', ';', '$', '>', '<', '`', '\\']
+        for char in dangerous_chars:
+            if char in script_path:
+                raise ValueError(f"Chemin de script invalide: caractère non autorisé '{char}'")
+        if not normalized_path.endswith('.py'):
+            raise ValueError("Le script doit avoir l'extension .py")
+        if not os.path.isfile(normalized_path):
+            raise ValueError(f"Le script n'existe pas: {normalized_path}")
+        return True
 
 
 class LogManager:
     """Gère la configuration et la rotation des logs."""
     
-    def __init__(self, log_dir: str, retention_days: int):
-        """Initialise le gestionnaire de logs.
-        
-        Args:
-            log_dir: Répertoire où stocker les fichiers de logs
-            retention_days: Nombre de jours de rétention des logs
-        """
+    def __init__(self, log_dir: str, global_retention: int):
         self.log_dir = log_dir
-        self.retention_days = retention_days
+        self.global_retention = global_retention
         os.makedirs(log_dir, exist_ok=True)
-        
-        # Configuration du logger principal
         self.setup_main_logger()
-        
-        # Date de dernière vérification des logs
         self.last_cleanup_check = datetime.datetime.now()
-        
+    
     def setup_main_logger(self) -> None:
-        """Configure le logger principal de l'application."""
         log_file = os.path.join(self.log_dir, f"scheduler_{datetime.datetime.now().strftime('%Y-%m-%d')}.log")
-        
-        # Configuration du handler de fichier avec rotation
         file_handler = RotatingFileHandler(
             filename=log_file,
-            maxBytes=5*1024*1024,  # 5 MB
+            maxBytes=5 * 1024 * 1024,
             backupCount=5
         )
-        
-        # Configuration du format de log
         log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(log_format)
-        
-        # Configuration du logger racine
         root_logger = logging.getLogger()
         root_logger.setLevel(logging.INFO)
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
         root_logger.addHandler(file_handler)
-        
-        # Ajout d'un handler pour la console
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(log_format)
         root_logger.addHandler(console_handler)
     
-    def get_job_log_file(self, script_name: str) -> str:
-        """Crée un fichier de log spécifique pour un script.
-        
-        Args:
-            script_name: Nom du script pour lequel créer un fichier de log
-            
-        Returns:
-            Chemin vers le fichier de log
-        """
-        script_base = os.path.basename(script_name).replace('.py', '')
-        return os.path.join(self.log_dir, f"{script_base}_{datetime.datetime.now().strftime('%Y-%m-%d')}.log")
+    def get_job_log_directory(self, job_name: str, repeat_time: str, retention: Optional[int] = None) -> str:
+        # Nettoie le nom de la tâche : remplace les espaces par des underscores et tronque à 30 caractères
+        sanitized = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in job_name).lower()
+        if len(sanitized) > 30:
+            sanitized = sanitized[:30]
+        base_dir_name = f"{sanitized}_{repeat_time}"
+        job_dir = os.path.join(self.log_dir, base_dir_name)
+        # Si le répertoire existe déjà, ajoute un suffixe numérique
+        if os.path.exists(job_dir):
+            suffix = 1
+            while os.path.exists(f"{job_dir}{suffix}"):
+                suffix += 1
+            job_dir = f"{job_dir}{suffix}"
+        os.makedirs(job_dir, exist_ok=True)
+        # Si une rétention spécifique est fournie, on la sauvegarde dans le répertoire
+        if retention is not None:
+            retention_file = os.path.join(job_dir, "retention.txt")
+            with open(retention_file, "w") as f:
+                f.write(str(retention))
+        return job_dir
+    
+    def get_job_log_file(self, job_name: str, repeat_time: str, retention: Optional[int] = None) -> str:
+        # Utilise le répertoire dédié au job pour créer le fichier de log
+        job_dir = self.get_job_log_directory(job_name, repeat_time, retention)
+        sanitized = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in job_name).lower()
+        if len(sanitized) > 30:
+            sanitized = sanitized[:30]
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        filename = f"{sanitized}_{timestamp}.log"
+        return os.path.join(job_dir, filename)
     
     def clear_old_logs(self, force: bool = False) -> None:
-        """Supprime les fichiers de log plus anciens que la période de rétention.
-        
-        Args:
-            force: Si True, effectue le nettoyage indépendamment de la dernière vérification
-        """
         now = datetime.datetime.now()
-        
-        # Vérification quotidienne uniquement, sauf si force=True
-        if not force and (now - self.last_cleanup_check).total_seconds() < 86400:  # 24 heures
+        if not force and (now - self.last_cleanup_check).total_seconds() < 86400:
             return
-            
         self.last_cleanup_check = now
-        retention_period = datetime.timedelta(days=self.retention_days)
-        
-        logging.info(f"Vérification des anciens fichiers de log (rétention: {self.retention_days} jours)")
-        
+        logging.info("Lancement du nettoyage des logs...")
         try:
-            for filename in os.listdir(self.log_dir):
-                file_path = os.path.join(self.log_dir, filename)
-                if os.path.isfile(file_path):
+            # Parcours de toutes les sous-arborescences de self.log_dir
+            for root, _, files in os.walk(self.log_dir):
+                # Vérifie si le répertoire contient un fichier retention.txt
+                retention_file = os.path.join(root, "retention.txt")
+                if os.path.isfile(retention_file):
+                    with open(retention_file, "r") as f:
+                        try:
+                            retention_days = int(f.read().strip())
+                        except Exception:
+                            retention_days = self.global_retention
+                else:
+                    retention_days = self.global_retention
+                retention_period = datetime.timedelta(days=retention_days)
+                for filename in files:
+                    file_path = os.path.join(root, filename)
                     file_creation_time = datetime.datetime.fromtimestamp(os.path.getctime(file_path))
                     if now - file_creation_time > retention_period:
                         os.remove(file_path)
@@ -138,123 +310,85 @@ class LogManager:
 class ScriptExecutor:
     """Gère l'exécution des scripts Python."""
     
-    def __init__(self, log_manager: LogManager):
-        """Initialise l'exécuteur de scripts.
-        
-        Args:
-            log_manager: Gestionnaire de logs à utiliser
-        """
+    def __init__(self, log_manager: LogManager, db_manager: DatabaseManager):
         self.log_manager = log_manager
+        self.db_manager = db_manager
     
     @staticmethod
     def clear_console() -> None:
-        """Efface la console en fonction du système d'exploitation."""
         if os.name == 'nt':
-            os.system('cls')  # Pour Windows
+            os.system('cls')
         else:
-            os.system('clear')  # Pour Unix/Linux/Mac
+            os.system('clear')
     
-    def execute(self, script: str, python_exec: str = "python", venv: Optional[str] = None) -> bool:
-        """Exécute un script Python.
-        
-        Args:
-            script: Chemin vers le script Python à exécuter
-            python_exec: Exécutable Python à utiliser
-            venv: Chemin optionnel vers un environnement virtuel
-            
-        Returns:
-            True si l'exécution s'est terminée avec succès, False sinon
-        """
+    @staticmethod
+    def secure_command(script: str, python_exec: str) -> List[str]:
+        script_path = pathlib.Path(script).resolve()
+        python_path = shlex.quote(python_exec)
+        if not script_path.exists() or script_path.suffix != '.py':
+            raise ValueError(f"Script invalide: {script}")
+        return [python_path, str(script_path)]
+    
+    def execute(self, job_id: str, job_name: str, script: str, repeat_time: str, retention: Optional[int], python_exec: str = "python", venv: Optional[str] = None) -> bool:
         self.clear_console()
         current_time = datetime.datetime.now()
-        log_file = self.log_manager.get_job_log_file(script)
-        
-        logging.info(f"Lancement du script Python {script}...")
-        
-        # Préparation de la commande
-        if venv:
-            if os.name == 'nt':
-                python_path = os.path.join(venv, 'Scripts', 'python.exe')
-            else:
-                python_path = os.path.join(venv, 'bin', 'python')
-        else:
-            python_path = python_exec
-        
-        cmd = [python_path, script]
-        
-        # Exécution du script
+        log_file = self.log_manager.get_job_log_file(job_name, repeat_time, retention)
+        logging.info(f"Lancement du script Python {script} (Job ID: {job_id} - {job_name})...")
+        run_id = self.db_manager.record_job_run(job_id, log_file)
         try:
+            if venv:
+                if os.name == 'nt':
+                    python_path = os.path.join(venv, 'Scripts', 'python.exe')
+                else:
+                    python_path = os.path.join(venv, 'bin', 'python')
+            else:
+                python_path = python_exec
+            cmd = self.secure_command(script, python_path)
             with open(log_file, 'a') as f:
-                f.write(f"[{current_time}] Lancement du script Python {script}...\n")
-                
+                f.write(f"[{current_time}] Lancement du script Python {script} (Job ID: {job_id} - {job_name})...\n")
                 result = subprocess.run(
-                    cmd, 
-                    check=True, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE, 
+                    cmd,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True
                 )
-                
                 f.write(result.stdout)
                 f.write(result.stderr)
-                
-                logging.info(f"Exécution réussie de {script}")
+                logging.info(f"Exécution réussie de {script} (Job ID: {job_id} - {job_name})")
                 logging.debug(result.stdout)
-                
                 if result.stderr:
                     logging.warning(f"Messages d'erreur de {script}: {result.stderr}")
-                
+                self.db_manager.update_job_run(run_id, 'success')
                 return True
-                
         except subprocess.CalledProcessError as e:
-            error_message = f"Erreur lors de l'exécution du script {script}: {e}"
-            
+            error_message = f"Erreur lors de l'exécution du script {script} (Job ID: {job_id} - {job_name}): {e}"
             with open(log_file, 'a') as f:
                 f.write(f"{error_message}\n")
                 f.write(e.stderr)
-            
             logging.error(error_message)
             logging.error(e.stderr)
-            
+            self.db_manager.update_job_run(run_id, 'error')
             return False
         except Exception as e:
-            logging.error(f"Exception inattendue lors de l'exécution de {script}: {e}")
+            logging.error(f"Exception inattendue lors de l'exécution de {script} (Job ID: {job_id} - {job_name}): {e}")
+            self.db_manager.update_job_run(run_id, 'error')
             return False
 
 
 class Scheduler:
     """Gère la planification et l'exécution périodique des scripts."""
     
-    def __init__(self, executor: ScriptExecutor, log_manager: LogManager):
-        """Initialise le planificateur.
-        
-        Args:
-            executor: Exécuteur de scripts à utiliser
-            log_manager: Gestionnaire de logs à utiliser
-        """
+    def __init__(self, executor: ScriptExecutor, log_manager: LogManager, db_manager: DatabaseManager):
         self.executor = executor
         self.log_manager = log_manager
-        self.scheduled_jobs = []
-        self.state_file = os.path.join(log_manager.log_dir, "scheduler_state.json")
-        
+        self.db_manager = db_manager
+    
     def parse_interval(self, repeat_time: str) -> datetime.timedelta:
-        """Parse une chaîne d'intervalle et la convertit en timedelta.
-        
-        Args:
-            repeat_time: Chaîne de caractères représentant l'intervalle (ex: "1h", "30m", "45s")
-            
-        Returns:
-            Objet timedelta correspondant à l'intervalle
-            
-        Raises:
-            ValueError: Si le format de l'intervalle est invalide
-        """
         match = re.match(r"(\d+)([hms])", repeat_time)
         if not match:
             raise ValueError("Intervalle invalide. Utilisez le format <durée><unité> (ex: 1h, 2m, 30s)")
-
         value, unit = int(match.group(1)), match.group(2)
-
         if unit == "h":
             return datetime.timedelta(hours=value)
         elif unit == "m":
@@ -264,276 +398,213 @@ class Scheduler:
         else:
             raise ValueError("Unité invalide. Utilisez 'h' pour heures, 'm' pour minutes, ou 's' pour secondes.")
     
-    def schedule_job(self, start_time_str: str, repeat_time: str, script: str, python_exec: str = "python", venv: Optional[str] = None) -> Tuple[datetime.datetime, datetime.timedelta]:
-        """Planifie l'exécution périodique d'un script.
-        
-        Args:
-            start_time_str: Heure de début au format "HH:MM:SS"
-            repeat_time: Intervalle de répétition (ex: "1h", "30m")
-            script: Chemin vers le script à exécuter
-            python_exec: Exécutable Python à utiliser
-            venv: Chemin optionnel vers un environnement virtuel
-            
-        Returns:
-            Tuple contenant la prochaine heure d'exécution et l'intervalle
-        """
-        # Normalisation de 24:00:00 à 00:00:00
+    def schedule_job(self, job_id: str, job_name: str, start_time_str: str, repeat_time: str, 
+                     script: str, python_exec: str = "python", venv: Optional[str] = None, log_retention: Optional[int] = None) -> Tuple[datetime.datetime, datetime.timedelta]:
         if start_time_str == "24:00:00":
             start_time_str = "00:00:00"
-
-        # Conversion de l'intervalle en timedelta
         interval = self.parse_interval(repeat_time)
-        
-        # Conversion de l'heure de début
         try:
             start_time = datetime.datetime.strptime(start_time_str, "%H:%M:%S").time()
         except ValueError:
             raise ValueError(f"Format d'heure invalide: {start_time_str}. Utilisez le format HH:MM:SS")
-
-        # Calcul de la prochaine exécution
         def calculate_next_run() -> datetime.datetime:
             now = datetime.datetime.now()
             first_run = datetime.datetime.combine(now.date(), start_time)
             while first_run <= now:
                 first_run += interval
             return first_run
-
         next_run_time = calculate_next_run()
-        
-        # Création de la tâche récurrente
         job_info = {
+            'id': job_id,
+            'name': job_name,
             'script': script,
             'python_exec': python_exec,
             'venv': venv,
+            'start_time': start_time_str,
+            'repeat_time': repeat_time,
             'interval': interval,
-            'next_run': next_run_time
+            'interval_seconds': int(interval.total_seconds()),
+            'next_run': next_run_time,
+            'log_retention': log_retention,
+            'active': 1
         }
-        
         def job_wrapper():
-            nonlocal job_info
-            # Exécution du script
-            self.executor.execute(job_info['script'], job_info['python_exec'], job_info['venv'])
-            
-            # Mise à jour de la prochaine exécution
+            # Exécute la tâche et affiche la prochaine exécution
+            self.executor.execute(job_info['id'], job_info['name'], job_info['script'], job_info['repeat_time'], job_info['python_exec'], job_info['venv'], )  # Note: On passe log_retention dans l'exécution via job_info
             job_info['next_run'] += job_info['interval']
-            
-            # Planification de la prochaine exécution
-            schedule.every().day.at(job_info['next_run'].strftime("%H:%M:%S")).do(job_wrapper).tag(job_info['script'])
-            
-            # Nettoyage des anciennes tâches pour éviter l'accumulation
-            schedule.clear(tag=job_info['script'])
-            
-            # Sauvegarde de l'état
-            self.save_state()
-
-        # Planification de la première exécution
-        schedule.every().day.at(next_run_time.strftime("%H:%M:%S")).do(job_wrapper).tag(script)
-        
-        # Ajout au suivi des tâches planifiées
-        self.scheduled_jobs.append(job_info)
-        
-        logging.info(f"Le script {script} commencera à {start_time_str} et sera répété toutes les {repeat_time}")
-        
+            self.db_manager.save_job(job_info)
+            schedule.clear(tag=job_info['id'])
+            schedule.every().day.at(job_info['next_run'].strftime("%H:%M:%S")).do(job_wrapper).tag(job_info['id'])
+            logging.info(f"Job '{job_info['name']}' prochaine exécution prévue à {job_info['next_run']}")
+        schedule.every().day.at(next_run_time.strftime("%H:%M:%S")).do(job_wrapper).tag(job_id)
+        self.db_manager.save_job(job_info)
+        logging.info(f"Job ID: {job_id} - '{job_name}' planifié: le script {script} commencera à {start_time_str}, sera répété toutes les {repeat_time} et prochaine exécution à {next_run_time}")
         return next_run_time, interval
-    
-    def get_next_run_time(self) -> Optional[datetime.datetime]:
-        """Obtient l'heure de la prochaine exécution planifiée.
-        
-        Returns:
-            Heure de la prochaine exécution, ou None si aucune tâche n'est planifiée
-        """
-        if not self.scheduled_jobs:
-            return None
-            
-        return min(job['next_run'] for job in self.scheduled_jobs)
-    
-    def save_state(self) -> None:
-        """Sauvegarde l'état actuel du planificateur."""
-        state = []
-        for job in self.scheduled_jobs:
-            state.append({
-                'script': job['script'],
-                'python_exec': job['python_exec'],
-                'venv': job['venv'],
-                'interval_seconds': job['interval'].total_seconds(),
-                'next_run': job['next_run'].isoformat()
-            })
-        
-        try:
-            with open(self.state_file, 'w') as f:
-                json.dump(state, f)
-        except Exception as e:
-            logging.error(f"Erreur lors de la sauvegarde de l'état: {e}")
-    
-    def load_state(self) -> bool:
-        """Charge l'état précédemment sauvegardé.
-        
-        Returns:
-            True si l'état a été chargé avec succès, False sinon
-        """
-        if not os.path.exists(self.state_file):
-            return False
-            
-        try:
-            with open(self.state_file, 'r') as f:
-                state = json.load(f)
-                
-            for job_state in state:
-                interval = datetime.timedelta(seconds=job_state['interval_seconds'])
-                next_run = datetime.datetime.fromisoformat(job_state['next_run'])
-                
-                # Si la prochaine exécution est dépassée, recalculer
-                now = datetime.datetime.now()
-                while next_run < now:
-                    next_run += interval
-                
-                job_info = {
-                    'script': job_state['script'],
-                    'python_exec': job_state['python_exec'],
-                    'venv': job_state['venv'],
-                    'interval': interval,
-                    'next_run': next_run
-                }
-                
-                def job_wrapper():
-                    nonlocal job_info
-                    self.executor.execute(job_info['script'], job_info['python_exec'], job_info['venv'])
-                    job_info['next_run'] += job_info['interval']
-                    schedule.every().day.at(job_info['next_run'].strftime("%H:%M:%S")).do(job_wrapper).tag(job_info['script'])
-                    schedule.clear(tag=job_info['script'])
-                    self.save_state()
-                
-                schedule.every().day.at(next_run.strftime("%H:%M:%S")).do(job_wrapper).tag(job_state['script'])
-                self.scheduled_jobs.append(job_info)
-                
-                logging.info(f"Tâche restaurée: {job_state['script']}, prochaine exécution: {next_run}")
-                
-            return True
-            
-        except Exception as e:
-            logging.error(f"Erreur lors du chargement de l'état: {e}")
-            return False
 
 
 def parse_arguments():
-    """Parse les arguments de ligne de commande.
-    
-    Returns:
-        Namespace contenant les arguments parsés
-    """
     parser = argparse.ArgumentParser(description="Planificateur de scripts Python")
+    # Option globale pour log_retention
+    parser.add_argument("--log_retention", type=int, default=7, help="Nombre de jours de rétention des logs global (défaut: 7)")
     
-    # Deux modes principaux: fichier de configuration ou arguments en ligne de commande
-    mode_group = parser.add_mutually_exclusive_group(required=True)
+    subparsers = parser.add_subparsers(dest='command', help='Commande à exécuter')
     
-    mode_group.add_argument('--config', 
-                        help='Chemin vers un fichier de configuration JSON')
+    # Commande 'add'
+    add_parser = subparsers.add_parser('add', help='Ajouter un nouveau job')
+    add_parser.add_argument('--config', help='Chemin vers un fichier de configuration JSON')
+    add_parser.add_argument('--id', help='Identifiant unique du job (optionnel, sera généré automatiquement si absent)')
+    add_parser.add_argument('--name', help='Nom descriptif du job')
+    add_parser.add_argument('--script', help='Chemin vers le script Python à exécuter')
+    add_parser.add_argument('--python_exec', default='python', help='Exécutable Python (défaut: python)')
+    add_parser.add_argument('--venv', help="Chemin vers l'environnement virtuel (optionnel)")
+    add_parser.add_argument('--start_time', help='Heure de début au format HH:MM:SS')
+    add_parser.add_argument('--repeat_time', help='Intervalle de répétition (ex: 1h, 30m, 45s)')
     
-    mode_group.add_argument('--start-time', 
-                        help='Heure de démarrage au format HH:MM:SS')
+    # Commande 'mod' pour modifier un job existant
+    mod_parser = subparsers.add_parser('mod', help='Modifier un job existant')
+    mod_parser.add_argument('--id', help='Identifiant unique du job à modifier', required=True)
+    mod_parser.add_argument('--name', help='Nouveau nom descriptif du job')
+    mod_parser.add_argument('--script', help='Nouveau chemin vers le script Python à exécuter')
+    mod_parser.add_argument('--python_exec', help='Nouvel exécutable Python')
+    mod_parser.add_argument('--venv', help="Nouveau chemin vers l'environnement virtuel")
+    mod_parser.add_argument('--start_time', help='Nouvelle heure de début au format HH:MM:SS')
+    mod_parser.add_argument('--repeat_time', help='Nouvel intervalle de répétition (ex: 1h, 30m, 45s)')
     
-    # Arguments pour le mode ligne de commande
-    parser.add_argument('--script', 
-                       help='Chemin vers le script Python à exécuter')
+    # Commande 'list'
+    subparsers.add_parser('list', help='Lister tous les jobs planifiés (chargés depuis la base de données)')
     
-    parser.add_argument('--repeat-time', 
-                       help='Intervalle de répétition (ex: 1h, 30m, 45s)')
+    # Commande 'remove'
+    remove_parser = subparsers.add_parser('remove', help='Supprimer un job')
+    remove_parser.add_argument('--id', help='Identifiant unique du job à supprimer', required=True)
     
-    parser.add_argument('--log-retention', type=int, default=30,
-                       help='Nombre de jours de conservation des logs (défaut: 30)')
+    # Commande 'show' pour afficher les paramètres d'un job
+    show_parser = subparsers.add_parser('show', help='Afficher les paramètres d\'un job')
+    show_parser.add_argument('--id', help='Identifiant unique du job à afficher', required=True)
     
-    parser.add_argument('--python-exec', default='python',
-                       help='Exécutable Python à utiliser (défaut: python)')
+    # Commande 'run'
+    subparsers.add_parser('run', help='Démarrer le planificateur (chargera les jobs depuis la DB)')
     
-    parser.add_argument('--venv',
-                       help='Chemin vers un environnement virtuel à utiliser')
-    
-    args = parser.parse_args()
-    
-    # Validation des arguments requis en mode ligne de commande
-    if args.start_time and not (args.script and args.repeat_time):
-        parser.error("--script et --repeat-time sont requis avec --start-time")
-    
-    return args
-
-
-def setup_signal_handlers(scheduler):
-    """Configure les gestionnaires de signaux pour une sortie propre.
-    
-    Args:
-        scheduler: Instance du planificateur à utiliser
-    """
-    def graceful_exit(signum, frame):
-        logging.info("Arrêt du programme en cours...")
-        scheduler.save_state()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, graceful_exit)
-    signal.signal(signal.SIGTERM, graceful_exit)
+    return parser.parse_args()
 
 
 def main():
-    """Point d'entrée principal du programme."""
-    # Parsing des arguments
     args = parse_arguments()
     
-    # Configuration à partir des arguments ou du fichier de configuration
-    if args.config:
-        try:
-            config = ConfigManager.load_config(args.config)
-            start_time_str = config['start_time']
-            script = config['script']
-            repeat_time = config['repeat_time']
-            log_retention_days = int(config['log_retention'])
-            python_exec = config.get('python_exec', 'python')
-            venv = config.get('venv')
-        except Exception as e:
-            print(f"Erreur lors du chargement de la configuration: {e}")
-            sys.exit(1)
-    else:
-        start_time_str = args.start_time
-        script = args.script
-        repeat_time = args.repeat_time
-        log_retention_days = args.log_retention
-        python_exec = args.python_exec
-        venv = args.venv
+    # Valeur globale de rétention
+    global_retention = args.log_retention
     
-    # Initialisation des composants
     log_dir = "logs"
-    log_manager = LogManager(log_dir, log_retention_days)
-    executor = ScriptExecutor(log_manager)
-    scheduler = Scheduler(executor, log_manager)
+    log_manager = LogManager(log_dir, global_retention)
+    db_manager = DatabaseManager()
+    executor = ScriptExecutor(log_manager, db_manager)
+    scheduler_obj = Scheduler(executor, log_manager, db_manager)
     
-    # Configuration des gestionnaires de signaux
-    setup_signal_handlers(scheduler)
+    if args.command == 'add':
+        if args.config:
+            try:
+                config = ConfigManager.load_config(args.config)
+            except Exception as e:
+                print(f"Erreur lors du chargement du fichier de configuration: {e}")
+                sys.exit(1)
+            job_id = str(uuid.uuid4())
+            job_name = config.get("name")
+            script = config.get("script")
+            python_exec = config.get("python_exec", "python")
+            venv = config.get("venv")
+            start_time = config.get("start_time")
+            repeat_time = config.get("repeat_time")
+            # Utilise la rétention définie dans le profil
+            profile_retention = int(config.get("log_retention", global_retention))
+        else:
+            missing = []
+            for field in ['name', 'script', 'start_time', 'repeat_time']:
+                if getattr(args, field) is None:
+                    missing.append(field)
+            if missing:
+                print(f"Argument(s) requis manquant(s): {', '.join(missing)}")
+                sys.exit(1)
+            job_id = args.id if args.id else str(uuid.uuid4())
+            job_name = args.name
+            script = args.script
+            python_exec = args.python_exec
+            venv = args.venv
+            start_time = args.start_time
+            repeat_time = args.repeat_time
+            profile_retention = None  # N'utilise que la valeur globale
+            
+        try:
+            next_run, interval = scheduler_obj.schedule_job(job_id, job_name, start_time, repeat_time, script, python_exec, venv, profile_retention)
+            print(f"Job ajouté: {job_id} - {job_name}, prochaine exécution à: {next_run}")
+        except Exception as e:
+            print(f"Erreur lors de la planification du job: {e}")
+            sys.exit(1)
     
-    # Tentative de chargement de l'état précédent
-    if not scheduler.load_state():
-        # Planification initiale si aucun état n'a été chargé
-        scheduler.schedule_job(start_time_str, repeat_time, script, python_exec, venv)
+    elif args.command == 'mod':
+        job = db_manager.get_job(args.id)
+        if not job:
+            print(f"Job avec l'ID {args.id} introuvable.")
+            sys.exit(1)
+        new_name = args.name if args.name is not None else job['name']
+        new_script = args.script if args.script is not None else job['script']
+        new_python_exec = args.python_exec if args.python_exec is not None else job['python_exec']
+        new_venv = args.venv if args.venv is not None else job['venv']
+        new_start_time = args.start_time if args.start_time is not None else job['start_time']
+        new_repeat_time = args.repeat_time if args.repeat_time is not None else job['repeat_time']
+        # On ne modifie pas la rétention si elle n'est pas passée en argument lors de la modif
+        new_retention = job.get("log_retention")
+        try:
+            next_run, interval = scheduler_obj.schedule_job(args.id, new_name, new_start_time, new_repeat_time, new_script, new_python_exec, new_venv, new_retention)
+            print(f"Job modifié: {args.id} - {new_name}, prochaine exécution à: {next_run}")
+        except Exception as e:
+            print(f"Erreur lors de la modification du job: {e}")
+            sys.exit(1)
     
-    # Boucle principale
-    try:
-        logging.info("Démarrage du planificateur")
-        
-        while True:
-            schedule.run_pending()
-            
-            next_run_time = scheduler.get_next_run_time()
-            if next_run_time:
-                next_run_time_str = next_run_time.strftime('%Y-%m-%d %H:%M:%S')
-                sys.stdout.write(f"\rLe prochain script sera lancé à {next_run_time_str}. Ctrl+C pour quitter.")
-                sys.stdout.flush()
-            
-            # Vérification des logs anciens (une fois par jour)
-            log_manager.clear_old_logs()
-            
-            time.sleep(1)
-            
-    except Exception as e:
-        logging.critical(f"Erreur fatale: {e}")
-        scheduler.save_state()
-        sys.exit(1)
+    elif args.command == 'list':
+        jobs = db_manager.get_all_jobs()
+        if not jobs:
+            print("Aucun job planifié.")
+        else:
+            for job in jobs:
+                print(f"ID: {job['id']}, Nom: {job['name']}, Prochaine exécution: {job['next_run']}")
+    
+    elif args.command == 'show':
+        job = db_manager.get_job(args.id)
+        if not job:
+            print(f"Job avec l'ID {args.id} introuvable.")
+        else:
+            print("Détails du job:")
+            for key, value in job.items():
+                print(f"  {key}: {value}")
+    
+    elif args.command == 'remove':
+        if db_manager.get_job(args.id):
+            db_manager.deactivate_job(args.id)
+            schedule.clear(tag=args.id)
+            print(f"Job {args.id} supprimé avec succès.")
+        else:
+            print(f"Job {args.id} introuvable.")
+    
+    elif args.command == 'run':
+        jobs = db_manager.get_all_jobs()
+        logging.info(f"{len(jobs)} jobs chargés depuis la base de données.")
+        print("Planificateur démarré. Appuyez sur Ctrl+C pour arrêter.")
+        try:
+            for job in jobs:
+                now = datetime.datetime.now()
+                interval = datetime.timedelta(seconds=job['interval_seconds'])
+                next_run = job['next_run']
+                while next_run < now:
+                    next_run += interval
+                scheduler_obj.schedule_job(job['id'], job['name'], job['start_time'], job['repeat_time'], job['script'], job['python_exec'], job['venv'], job.get("log_retention"))
+            while True:
+                schedule.run_pending()
+                time.sleep(1)
+                log_manager.clear_old_logs()
+        except KeyboardInterrupt:
+            print("Arrêt du planificateur.")
+    
+    else:
+        print("Commande non reconnue. Utilisez --help pour voir les commandes disponibles.")
 
 
 if __name__ == "__main__":
